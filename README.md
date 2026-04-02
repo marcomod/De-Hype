@@ -1,3 +1,5 @@
+<<<<<<< HEAD
+
 # De-Hype
 
 Chrome extension that rewrites sensationalist titles to short factual summaries.
