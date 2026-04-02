@@ -1,5 +1,5 @@
 const SYSTEM_PROMPT =
-  "You are an anti-clickbait assistant. Rewrite the following title into a boring, factual, 5-word summary. Remove all hyperbole, caps lock, and emojis.";
+  "You are an anti-clickbait assistant. Rewrite the headline into one neutral, factual sentence between 8 and 12 words. Remove hype, caps lock, emojis, and sensational framing.";
 const MODEL = "gpt-4o-mini";
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 
@@ -15,6 +15,9 @@ const COUNTER_KEY = "deHypeDailyCounter";
 const BUDGET_KEY = "deHypeBudget";
 const STATS_KEY = "deHypeStats";
 const LAST_ERROR_KEY = "deHypeLastError";
+const SEEN_KEY = "deHypeDailySeen";
+const API_BACKOFF_KEY = "deHypeApiBackoff";
+const API_BACKOFF_MS = 3 * 60 * 1000;
 
 const pendingByKey = new Map();
 
@@ -51,10 +54,32 @@ const hashText = (text) => {
   return hash.toString(16);
 };
 
-const enforceFiveWords = (value = "") => {
-  const text = String(value).replace(/["“”'‘’`]/g, "").trim();
-  const words = text.split(/\s+/).filter(Boolean).slice(0, 5);
-  return words.join(" ");
+const finalizeSummary = (candidate = "", fallbackSource = "") => {
+  let text = normalizeText(String(candidate).replace(/["“”'‘’`]/g, ""));
+  const firstSentence = text
+    .split(/[.!?]/)
+    .map((part) => normalizeText(part))
+    .find((part) => part.split(/\s+/).filter(Boolean).length >= 6);
+  if (firstSentence) text = firstSentence;
+  text = text.replace(/[!?]{2,}/g, ".");
+  text = text.replace(/\s+\./g, ".");
+  if (!text) text = normalizeText(fallbackSource);
+
+  let words = text.split(/\s+/).filter(Boolean);
+  if (words.length > 16) words = words.slice(0, 16);
+
+  if (words.length < 8) {
+    const fallbackWords = heuristicRewrite(fallbackSource)
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
+    words = words.concat(fallbackWords).slice(0, 12);
+  }
+
+  if (words.length === 0) words = ["reported", "update", "with", "limited", "public", "details"];
+  const sentence = words.join(" ");
+  const normalizedSentence = sentence.charAt(0).toUpperCase() + sentence.slice(1);
+  return normalizedSentence.endsWith(".") ? normalizedSentence : `${normalizedSentence}.`;
 };
 
 const safeErrorMessage = (error) => {
@@ -95,6 +120,11 @@ const defaultStatsState = () => ({
   skipped: 0
 });
 
+const defaultSeenState = () => ({
+  date: toDayKey(),
+  seen: {}
+});
+
 const getBudgetState = async () => {
   const stored = (await chrome.storage.local.get(BUDGET_KEY))[BUDGET_KEY];
   if (!stored) return defaultBudgetState();
@@ -133,6 +163,14 @@ const consumeBudgetToken = async () => {
   return next;
 };
 
+const refundBudgetToken = async () => {
+  const budget = await getBudgetState();
+  if (budget.used <= 0) return budget;
+  const next = { ...budget, used: budget.used - 1 };
+  await persistBudgetState(next);
+  return next;
+};
+
 const getStatsState = async () => {
   const stored = (await chrome.storage.local.get(STATS_KEY))[STATS_KEY];
   if (!stored) return defaultStatsState();
@@ -166,6 +204,34 @@ const incrementCounter = async () => {
   await chrome.storage.local.set({ [COUNTER_KEY]: next });
 };
 
+const getSeenState = async () => {
+  const stored = (await chrome.storage.local.get(SEEN_KEY))[SEEN_KEY];
+  if (!stored || typeof stored !== "object") return defaultSeenState();
+  const today = toDayKey();
+  if (stored.date !== today) return defaultSeenState();
+
+  return {
+    date: today,
+    seen: stored.seen && typeof stored.seen === "object" ? stored.seen : {}
+  };
+};
+
+const markTitleSeen = async (normalizedText) => {
+  const state = await getSeenState();
+  const key = hashText(normalizedText);
+  if (state.seen[key]) return false;
+  state.seen[key] = 1;
+  await chrome.storage.local.set({ [SEEN_KEY]: state });
+  return true;
+};
+
+const incrementCounterForTitle = async (normalizedText) => {
+  const isNew = await markTitleSeen(normalizedText);
+  if (!isNew) return false;
+  await incrementCounter();
+  return true;
+};
+
 const getCounter = async () => {
   const state = (await chrome.storage.local.get(COUNTER_KEY))[COUNTER_KEY];
   if (!state || state.date !== toDayKey()) return 0;
@@ -187,6 +253,29 @@ const clearLastError = async () => {
 };
 
 const getLastError = async () => (await chrome.storage.local.get(LAST_ERROR_KEY))[LAST_ERROR_KEY] || null;
+
+const getActiveApiBackoff = async () => {
+  const state = (await chrome.storage.local.get(API_BACKOFF_KEY))[API_BACKOFF_KEY];
+  if (!state || typeof state.until !== "number") return null;
+  if (state.until <= Date.now()) {
+    await chrome.storage.local.set({ [API_BACKOFF_KEY]: null });
+    return null;
+  }
+  return state;
+};
+
+const setApiBackoff = async (code) => {
+  await chrome.storage.local.set({
+    [API_BACKOFF_KEY]: {
+      code: code || "api_error",
+      until: Date.now() + API_BACKOFF_MS
+    }
+  });
+};
+
+const clearApiBackoff = async () => {
+  await chrome.storage.local.set({ [API_BACKOFF_KEY]: null });
+};
 
 const getCachedRewrite = async (normalizedText) => {
   const cachedBag = (await chrome.storage.local.get(CACHE_KEY))[CACHE_KEY] || {};
@@ -237,12 +326,13 @@ const heuristicRewrite = (title) => {
   text = text.replace(/[^\p{L}\p{N}\s'-]/gu, " ");
   text = normalizeText(text.toLowerCase());
 
-  const words = text.split(/\s+/).filter(Boolean).slice(0, 8);
-  if (words.length === 0) return "Reported update with limited details";
-  while (words.length < 5) words.push("details");
+  const words = text.split(/\s+/).filter(Boolean).slice(0, 10);
+  if (words.length === 0) return "Reported update with limited public details.";
+  while (words.length < 8) words.push("details");
 
   const sentence = words.join(" ");
-  return sentence.charAt(0).toUpperCase() + sentence.slice(1);
+  const normalizedSentence = sentence.charAt(0).toUpperCase() + sentence.slice(1);
+  return normalizedSentence.endsWith(".") ? normalizedSentence : `${normalizedSentence}.`;
 };
 
 const callOpenAI = async (title) => {
@@ -250,7 +340,7 @@ const callOpenAI = async (title) => {
   const payload = {
     model: MODEL,
     temperature: 0.2,
-    max_tokens: 24,
+    max_tokens: 48,
     messages: [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: title }
@@ -280,7 +370,7 @@ const callOpenAI = async (title) => {
 
     const body = await response.json();
     const raw = body?.choices?.[0]?.message?.content || "";
-    return enforceFiveWords(raw);
+    return finalizeSummary(raw, title);
   } catch (error) {
     if (error?.name === "AbortError") {
       const timeoutError = new Error("OpenAI request timed out");
@@ -307,15 +397,23 @@ const processDehypeRequest = async (rawText) => {
   const promise = (async () => {
     const cached = await getCachedRewrite(cacheKeyInput);
     if (cached?.rewritten) {
-      await incrementCounter();
+      await incrementCounterForTitle(cacheKeyInput);
       await incrementStat("cache");
       return { text: cached.rewritten, source: "cache" };
+    }
+
+    const activeBackoff = await getActiveApiBackoff();
+    if (activeBackoff) {
+      const fallback = heuristicRewrite(normalized);
+      await incrementCounterForTitle(cacheKeyInput);
+      await incrementStat("fallback");
+      return { text: fallback, source: "fallback", reason: activeBackoff.code || "api_backoff" };
     }
 
     const consumedBudget = await consumeBudgetToken();
     if (!consumedBudget) {
       const budgetFallback = heuristicRewrite(normalized);
-      await incrementCounter();
+      await incrementCounterForTitle(cacheKeyInput);
       await incrementStat("fallback");
       await incrementStat("skipped");
       return { text: budgetFallback, source: "budget", reason: "budget_reached" };
@@ -324,16 +422,22 @@ const processDehypeRequest = async (rawText) => {
     try {
       const rewritten = await callOpenAI(normalized);
       await setCachedRewrite(cacheKeyInput, rewritten, "api");
-      await incrementCounter();
+      await incrementCounterForTitle(cacheKeyInput);
       await incrementStat("api");
       await clearLastError();
+      await clearApiBackoff();
       return { text: rewritten, source: "api" };
     } catch (error) {
+      await refundBudgetToken();
       const fallback = heuristicRewrite(normalized);
-      await incrementCounter();
+      await incrementCounterForTitle(cacheKeyInput);
       await incrementStat("fallback");
-      await setLastError(error?.code || "api_error", safeErrorMessage(error));
-      return { text: fallback, source: "fallback", reason: error?.code || "api_error" };
+      const errorCode = error?.code || "api_error";
+      await setLastError(errorCode, safeErrorMessage(error));
+      if (["insufficient_quota", "rate_limited", "auth_error", "forbidden", "missing_key", "timeout"].includes(errorCode)) {
+        await setApiBackoff(errorCode);
+      }
+      return { text: fallback, source: "fallback", reason: errorCode };
     }
   })();
 
