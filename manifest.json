@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "De-Hype",
+  "description": "Noise-canceling browser extension that neutralizes clickbait titles in real time.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "permissions": ["storage"],
+  "action": {
+    "default_title": "De-Hype",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "host_permissions": [
+    "https://*.youtube.com/*",
+    "https://www.youtube.com/*",
+    "https://*.cnn.com/*",
+    "https://www.cnn.com/*",
+    "https://*.theverge.com/*",
+    "https://www.theverge.com/*",
+    "https://api.openai.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.youtube.com/*",
+        "https://www.youtube.com/*",
+        "https://*.cnn.com/*",
+        "https://www.cnn.com/*",
+        "https://*.theverge.com/*",
+        "https://www.theverge.com/*"
+      ],
+      "js": ["contentScript.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
