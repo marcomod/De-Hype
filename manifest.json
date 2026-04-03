@@ -4,12 +4,35 @@
   "description": "Noise-canceling browser extension that neutralizes clickbait titles in real time.",
   "version": "0.1.0",
   "minimum_chrome_version": "116",
-  "permissions": ["storage"],
+  "permissions": ["storage", "tabs"],
   "action": {
     "default_title": "De-Hype",
     "default_popup": "popup.html"
   },
   "options_page": "options.html",
+  "commands": {
+    "toggle-dehype": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "Toggle De-Hype on or off"
+    },
+    "toggle-demo-mode": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+D",
+        "mac": "Command+Shift+D"
+      },
+      "description": "Toggle Demo Mode"
+    },
+    "toggle-tab-pause": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+P",
+        "mac": "Command+Shift+P"
+      },
+      "description": "Pause or resume De-Hype in the current tab"
+    }
+  },
   "host_permissions": [
     "https://*.youtube.com/*",
     "https://www.youtube.com/*",

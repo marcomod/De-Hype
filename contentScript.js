@@ -43,7 +43,18 @@ const TEXT_NODE_SELECTORS = "a#video-title, h1, h2, h3, a, yt-formatted-string, 
 const YOUTUBE_CARD_SELECTORS =
   "ytd-rich-item-renderer, ytd-rich-grid-media, ytd-video-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer, ytd-playlist-video-renderer, ytd-reel-item-renderer, ytd-watch-metadata";
 
+const DEFAULT_SITE_TOGGLES = {
+  youtube: true,
+  cnn: true,
+  verge: true,
+  generic: true
+};
+
 let deHypeEnabled = true;
+let tabPaused = false;
+let currentMode = "balanced";
+let siteToggles = { ...DEFAULT_SITE_TOGGLES };
+
 let targetCounter = 0;
 let activeCount = 0;
 let mutationTimer = null;
@@ -55,10 +66,6 @@ const observedElements = new Set();
 const mutationRoots = new Set();
 
 const normalizeText = (value = "") => value.replace(/\s+/g, " ").trim();
-const isValidHeadline = (text) => {
-  const words = text.split(/\s+/).filter(Boolean);
-  return text.length >= MIN_TITLE_LENGTH && text.length <= MAX_TITLE_LENGTH && words.length >= 4;
-};
 
 const detectProfile = () => {
   const host = window.location.hostname;
@@ -67,6 +74,18 @@ const detectProfile = () => {
   if (host.includes("theverge.com")) return "verge";
   return "generic";
 };
+
+const isValidHeadline = (text) => {
+  const words = text.split(/\s+/).filter(Boolean);
+  return text.length >= MIN_TITLE_LENGTH && text.length <= MAX_TITLE_LENGTH && words.length >= 4;
+};
+
+const isProfileEnabled = () => {
+  const profile = detectProfile();
+  return siteToggles[profile] !== false;
+};
+
+const isFeatureActive = () => deHypeEnabled && !tabPaused && isProfileEnabled();
 
 const getSelectorPlan = () => {
   const profile = detectProfile();
@@ -82,37 +101,56 @@ const ensureStyle = () => {
   const style = document.createElement("style");
   style.id = STYLE_ID;
   style.textContent = `
-    .dehype-summary {
+    .dehype-compare {
       display: block;
       margin-top: 6px;
-      padding: 4px 8px;
-      border-left: 2px solid #0ea5e9;
-      border-radius: 6px;
+      padding: 8px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-left: 3px solid #0ea5e9;
+      border-radius: 8px;
+      background: rgba(248, 250, 252, 0.92);
+      color: #0f172a;
       font-size: 12px;
       line-height: 1.35;
       letter-spacing: 0.01em;
-      background: rgba(148, 163, 184, 0.18);
-      color: #334155;
-      opacity: 0.95;
-      word-break: break-word;
       max-width: 100%;
       white-space: normal !important;
       text-overflow: clip !important;
       overflow: visible !important;
       -webkit-line-clamp: unset !important;
+      box-sizing: border-box;
     }
-    .dehype-summary[data-source="cache"] {
+
+    .dehype-compare[data-source="cache"] {
       border-left-color: #22c55e;
     }
-    .dehype-summary[data-source="fallback"],
-    .dehype-summary[data-source="budget"] {
+
+    .dehype-compare[data-source="fallback"],
+    .dehype-compare[data-source="budget"] {
       border-left-color: #f59e0b;
     }
-    html[dark] .dehype-summary,
-    ytd-app[dark] .dehype-summary,
-    body[data-theme="dark"] .dehype-summary {
+
+    .dehype-summary-text {
+      color: #0f172a;
+      word-break: break-word;
+      overflow: visible !important;
+      text-overflow: clip !important;
+      white-space: normal !important;
+      -webkit-line-clamp: unset !important;
+    }
+
+    html[dark] .dehype-compare,
+    ytd-app[dark] .dehype-compare,
+    body[data-theme="dark"] .dehype-compare {
+      background: rgba(2, 6, 23, 0.88);
       color: #e2e8f0;
-      background: rgba(15, 23, 42, 0.78);
+      border-color: rgba(71, 85, 105, 0.5);
+    }
+
+    html[dark] .dehype-summary-text,
+    ytd-app[dark] .dehype-summary-text,
+    body[data-theme="dark"] .dehype-summary-text {
+      color: #e2e8f0;
     }
   `;
   (document.head || document.documentElement).appendChild(style);
@@ -129,8 +167,8 @@ const isClippingContainer = (element) => {
   if (/(hidden|clip)/.test(overflowValues)) {
     if (style.display.includes("-webkit-box")) return true;
     if (style.maxHeight !== "none") return true;
-    if (style.height !== "auto" && style.height !== "0px") return true;
   }
+
   return false;
 };
 
@@ -144,9 +182,11 @@ const toAnchorId = (element) => {
 
 const scoreTextNode = (node, text) => {
   let score = text.length;
-  if (node.matches("a#video-title")) score += 80;
-  if (node.matches("h1, h2, h3")) score += 40;
-  if (node.matches("a")) score += 20;
+  if (node.matches("a#video-title")) score += 90;
+  if (node.matches("a#video-title-link")) score += 90;
+  if (node.matches("h1, h2, h3")) score += 45;
+  if (node.matches("yt-formatted-string#video-title")) score += 80;
+  if (node.matches("a")) score += 18;
   return score;
 };
 
@@ -159,12 +199,13 @@ const extractBestTitleNode = (candidate) => {
   let best = null;
   for (const node of nodes) {
     if (!(node instanceof Element)) continue;
-    if (node.closest(".dehype-summary")) continue;
+    if (node.closest(".dehype-compare")) continue;
     const text = normalizeText(node.textContent || "");
     if (!isValidHeadline(text)) continue;
-    const candidateScore = scoreTextNode(node, text);
-    if (!best || candidateScore > best.score) {
-      best = { node, text, score: candidateScore };
+
+    const nodeScore = scoreTextNode(node, text);
+    if (!best || nodeScore > best.score) {
+      best = { node, text, score: nodeScore };
     }
   }
 
@@ -175,13 +216,13 @@ const escapeClipping = (node) => {
   if (!(node instanceof Element)) return null;
   let anchor = node;
   let hops = 0;
-  while (anchor.parentElement && hops < 10 && isClippingContainer(anchor.parentElement)) {
+
+  while (anchor.parentElement && hops < 8 && isClippingContainer(anchor.parentElement)) {
     anchor = anchor.parentElement;
     hops += 1;
   }
-  if (anchor.tagName === "A" && anchor.parentElement) {
-    return anchor.parentElement;
-  }
+
+  if (anchor.tagName === "A" && anchor.parentElement) return anchor.parentElement;
   return anchor;
 };
 
@@ -189,37 +230,55 @@ const resolveInsertAnchor = (candidate, textNode) => {
   const profile = detectProfile();
 
   if (profile === "youtube") {
+    const watchTitle = textNode.closest("h1.ytd-watch-metadata, #title h1, ytd-watch-metadata");
+    if (watchTitle instanceof Element) {
+      return { node: watchTitle, mode: "after" };
+    }
+
+    const titleWrapper = textNode.closest("#title-wrapper, #title, h3, #video-title");
+    if (titleWrapper instanceof Element) {
+      return { node: titleWrapper, mode: "after" };
+    }
+
     const card = candidate.closest(YOUTUBE_CARD_SELECTORS);
-    if (card) {
-      const metaContainer = card.querySelector("#meta, #details, #title-wrapper, #top-row");
-      if (metaContainer instanceof Element && !isClippingContainer(metaContainer)) {
-        return { node: metaContainer, mode: "append" };
-      }
+    const meta = card?.querySelector("#meta, #details, #dismissible");
+    if (meta instanceof Element) {
+      return { node: meta, mode: "append" };
     }
   }
 
-  const semantic = textNode.closest("h1, h2, h3, a, yt-formatted-string, .duet--title, .container__headline, .headline");
+  if (profile === "verge") {
+    const vergeTitle = textNode.closest(".duet--article--headline, .duet--title, .c-entry-box--compact__title, h1, h2, h3");
+    if (vergeTitle instanceof Element) {
+      return { node: vergeTitle, mode: "after" };
+    }
+  }
+
+  const semantic = textNode.closest("h1, h2, h3, a, yt-formatted-string, .container__headline, .headline");
   const anchor = escapeClipping(semantic || textNode);
   return { node: anchor || textNode, mode: "after" };
 };
 
-const getSummaryNode = (anchorNode, mode) => {
+const getCompareNode = (anchorNode, mode) => {
   const anchorId = toAnchorId(anchorNode);
+
   if (mode === "append") {
-    return anchorNode.querySelector(`.dehype-summary[data-anchor-id="${anchorId}"]`);
+    return anchorNode.querySelector(`.dehype-compare[data-anchor-id="${anchorId}"]`);
   }
+
   const directNext = anchorNode.nextElementSibling;
-  if (directNext && directNext.classList.contains("dehype-summary") && directNext.dataset.anchorId === anchorId) {
+  if (directNext && directNext.classList.contains("dehype-compare") && directNext.dataset.anchorId === anchorId) {
     return directNext;
   }
+
   const parent = anchorNode.parentElement;
   if (!parent) return null;
-  return parent.querySelector(`.dehype-summary[data-anchor-id="${anchorId}"]`);
+  return parent.querySelector(`.dehype-compare[data-anchor-id="${anchorId}"]`);
 };
 
 const resolveCandidate = (candidate) => {
   if (!(candidate instanceof Element)) return null;
-  if (candidate.closest(".dehype-summary")) return null;
+  if (candidate.closest(".dehype-compare")) return null;
 
   const extracted = extractBestTitleNode(candidate);
   if (!extracted) return null;
@@ -228,55 +287,72 @@ const resolveCandidate = (candidate) => {
   const anchor = resolveInsertAnchor(candidate, textNode);
   if (!anchor?.node?.isConnected) return null;
 
-  return { text, anchorNode: anchor.node, mode: anchor.mode };
+  return {
+    text,
+    anchorNode: anchor.node,
+    mode: anchor.mode
+  };
 };
 
 const shouldProcess = (resolved) => {
-  if (!deHypeEnabled) return false;
   if (!resolved?.anchorNode?.isConnected) return false;
+  if (!isFeatureActive()) return false;
   if (!isValidHeadline(resolved.text)) return false;
 
-  const processed = resolved.anchorNode.dataset.dehypeProcessedText || "";
-  const normalized = resolved.text.toLowerCase();
+  const existing = getCompareNode(resolved.anchorNode, resolved.mode);
   const previousRaw = resolved.anchorNode.dataset.dehypeRawText || "";
-  const existingSummary = getSummaryNode(resolved.anchorNode, resolved.mode);
+  if (existing && previousRaw && resolved.text.length < previousRaw.length * 0.85) return false;
 
-  if (existingSummary && previousRaw && resolved.text.length < previousRaw.length * 0.85) return false;
-  if (processed === normalized && getSummaryNode(resolved.anchorNode, resolved.mode)) return false;
+  const signature = `${currentMode}|${resolved.text.toLowerCase()}`;
+  const processedSignature = resolved.anchorNode.dataset.dehypeProcessedSignature || "";
+  if (existing && signature === processedSignature) return false;
+
   return true;
 };
 
-const upsertSummary = (resolved, summaryText, source) => {
-  if (!summaryText || !resolved?.anchorNode?.isConnected) return;
+const upsertCompareBlock = (resolved, payload) => {
+  if (!payload?.summary || !resolved?.anchorNode?.isConnected) return;
   ensureStyle();
 
   const { anchorNode, mode, text } = resolved;
   const anchorId = toAnchorId(anchorNode);
-  let summaryNode = getSummaryNode(anchorNode, mode);
+  let block = getCompareNode(anchorNode, mode);
 
-  if (!summaryNode) {
-    summaryNode = document.createElement("div");
-    summaryNode.className = "dehype-summary";
-    summaryNode.dataset.dehypeSummary = "1";
-    summaryNode.dataset.anchorId = anchorId;
-    if (mode === "append") {
-      anchorNode.appendChild(summaryNode);
-    } else {
-      anchorNode.insertAdjacentElement("afterend", summaryNode);
-    }
+  if (!block) {
+    block = document.createElement("div");
+    block.className = "dehype-compare";
+    block.dataset.dehypeSummary = "1";
+    block.dataset.anchorId = anchorId;
+
+    if (mode === "append") anchorNode.appendChild(block);
+    else anchorNode.insertAdjacentElement("afterend", block);
   }
 
-  summaryNode.textContent = summaryText;
-  summaryNode.dataset.source = source || "api";
-  anchorNode.dataset.dehypeProcessedText = text.toLowerCase();
+  block.dataset.source = payload.source || "fallback";
+  block.textContent = "";
+
+  const summaryNode = document.createElement("div");
+  summaryNode.className = "dehype-summary-text";
+  summaryNode.textContent = payload.summary;
+  block.appendChild(summaryNode);
+
   anchorNode.dataset.dehypeRawText = text;
+  anchorNode.dataset.dehypeProcessedSignature = `${currentMode}|${text.toLowerCase()}`;
 };
 
 const requestRewrite = (text) =>
   new Promise((resolve, reject) => {
     chrome.runtime.sendMessage({ type: "DEHYPE_REQUEST", text }, (response) => {
-      if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
-      if (!response || !response.ok) return reject(new Error(response?.error || "De-hype failed"));
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+
+      if (!response || !response.ok) {
+        reject(new Error(response?.error || "De-hype failed"));
+        return;
+      }
+
       resolve(response);
     });
   });
@@ -287,7 +363,8 @@ const processCandidate = async (candidate) => {
 
   try {
     const response = await requestRewrite(resolved.text);
-    if (response?.text) upsertSummary(resolved, response.text, response.source);
+    if (!response?.summary) return;
+    upsertCompareBlock(resolved, response);
   } catch (error) {
     console.debug("[De-Hype] Rewrite failed:", error?.message || error);
   }
@@ -297,8 +374,9 @@ const processQueue = () => {
   while (activeCount < PROCESS_CONCURRENCY && processingQueue.length > 0) {
     const element = processingQueue.shift();
     queuedElements.delete(element);
+
     if (!element?.isConnected) continue;
-    if (!deHypeEnabled) break;
+    if (!isFeatureActive()) break;
 
     activeCount += 1;
     inflightElements.add(element);
@@ -314,9 +392,10 @@ const processQueue = () => {
 };
 
 const enqueueCandidate = (element) => {
-  if (!deHypeEnabled) return;
+  if (!isFeatureActive()) return;
   if (!(element instanceof Element)) return;
   if (queuedElements.has(element) || inflightElements.has(element)) return;
+
   queuedElements.add(element);
   processingQueue.push(element);
   processQueue();
@@ -344,8 +423,10 @@ const observeCandidate = (element) => {
 
 const collectCandidates = (root = document) => {
   if (!(root instanceof Element || root instanceof Document)) return [];
+
   const plan = getSelectorPlan();
   const result = new Set();
+
   const collectBySelectors = (selectors) => {
     for (const selector of selectors) {
       if (root instanceof Element && root.matches(selector)) result.add(root);
@@ -363,7 +444,7 @@ const collectCandidates = (root = document) => {
 };
 
 const scan = (root = document) => {
-  if (!deHypeEnabled) return;
+  if (!isFeatureActive()) return;
   collectCandidates(root).forEach(observeCandidate);
 };
 
@@ -381,47 +462,104 @@ const scheduleMutationScan = (root) => {
   mutationTimer = setTimeout(flushMutationRoots, MUTATION_DEBOUNCE_MS);
 };
 
-const clearInjectedSummaries = () => {
-  document.querySelectorAll(".dehype-summary[data-dehype-summary='1']").forEach((node) => node.remove());
-  document.querySelectorAll("[data-dehype-processed-text]").forEach((node) => node.removeAttribute("data-dehype-processed-text"));
-  document.querySelectorAll("[data-dehype-raw-text]").forEach((node) => node.removeAttribute("data-dehype-raw-text"));
-  document.querySelectorAll("[data-dehype-anchor-id]").forEach((node) => node.removeAttribute("data-dehype-anchor-id"));
-};
-
 const clearProcessing = () => {
   processingQueue.length = 0;
   queuedElements.clear();
   inflightElements.clear();
-  intersectionObserver.disconnect();
   observedElements.clear();
+  mutationRoots.clear();
+  intersectionObserver.disconnect();
 };
 
-chrome.storage.local.get(["deHypeEnabled"]).then((state) => {
+const clearInjectedSummaries = () => {
+  document.querySelectorAll(".dehype-compare[data-dehype-summary='1']").forEach((node) => node.remove());
+  document.querySelectorAll("[data-dehype-processed-signature]").forEach((node) => node.removeAttribute("data-dehype-processed-signature"));
+  document.querySelectorAll("[data-dehype-raw-text]").forEach((node) => node.removeAttribute("data-dehype-raw-text"));
+  document.querySelectorAll("[data-dehype-anchor-id]").forEach((node) => node.removeAttribute("data-dehype-anchor-id"));
+};
+
+const requestTabState = () =>
+  new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: "GET_TAB_STATE" }, (response) => {
+      if (chrome.runtime.lastError || !response?.ok) {
+        resolve({ paused: false });
+        return;
+      }
+      resolve({ paused: !!response.paused });
+    });
+  });
+
+const refreshRuntimeSettings = async () => {
+  const state = await chrome.storage.local.get(["deHypeEnabled", "deHypeMode", "deHypeSiteToggles"]);
   deHypeEnabled = state.deHypeEnabled !== false;
-  if (deHypeEnabled) scan(document);
-});
+  currentMode = typeof state.deHypeMode === "string" ? state.deHypeMode : "balanced";
+  siteToggles = {
+    youtube: state.deHypeSiteToggles?.youtube !== false,
+    cnn: state.deHypeSiteToggles?.cnn !== false,
+    verge: state.deHypeSiteToggles?.verge !== false,
+    generic: state.deHypeSiteToggles?.generic !== false
+  };
+
+  const tabState = await requestTabState();
+  tabPaused = tabState.paused === true;
+};
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
-  if (!Object.prototype.hasOwnProperty.call(changes, "deHypeEnabled")) return;
 
-  deHypeEnabled = changes.deHypeEnabled.newValue;
-  if (!deHypeEnabled) {
-    clearProcessing();
-    clearInjectedSummaries();
-    return;
+  let needsRescan = false;
+  let modeChanged = false;
+
+  if (Object.prototype.hasOwnProperty.call(changes, "deHypeEnabled")) {
+    deHypeEnabled = changes.deHypeEnabled.newValue !== false;
+    needsRescan = true;
   }
-  scan(document);
+
+  if (Object.prototype.hasOwnProperty.call(changes, "deHypeSiteToggles")) {
+    siteToggles = {
+      youtube: changes.deHypeSiteToggles.newValue?.youtube !== false,
+      cnn: changes.deHypeSiteToggles.newValue?.cnn !== false,
+      verge: changes.deHypeSiteToggles.newValue?.verge !== false,
+      generic: changes.deHypeSiteToggles.newValue?.generic !== false
+    };
+    needsRescan = true;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(changes, "deHypeMode")) {
+    currentMode = typeof changes.deHypeMode.newValue === "string" ? changes.deHypeMode.newValue : "balanced";
+    modeChanged = true;
+    needsRescan = true;
+  }
+
+  if (!needsRescan) return;
+
+  if (modeChanged) {
+    clearInjectedSummaries();
+  }
+
+  clearProcessing();
+  if (isFeatureActive()) scan(document);
+});
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (!message || message.type !== "TAB_PAUSE_STATE") return false;
+
+  tabPaused = message.paused === true;
+  clearProcessing();
+  if (isFeatureActive()) scan(document);
+  return false;
 });
 
 const mutationObserver = new MutationObserver((mutations) => {
-  if (!deHypeEnabled) return;
+  if (!isFeatureActive()) return;
+
   for (const mutation of mutations) {
     if (mutation.type === "childList") {
       for (const node of mutation.addedNodes) {
         if (node instanceof Element) scheduleMutationScan(node);
       }
     }
+
     if (mutation.type === "characterData") {
       const parent = mutation.target?.parentElement;
       if (parent instanceof Element) scheduleMutationScan(parent);
@@ -438,8 +576,14 @@ const startMutationObserver = () => {
   });
 };
 
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", startMutationObserver, { once: true });
-} else {
+const initialize = async () => {
+  await refreshRuntimeSettings();
+  if (isFeatureActive()) scan(document);
   startMutationObserver();
+};
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initialize, { once: true });
+} else {
+  initialize();
 }
